@@ -1,0 +1,208 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, LSTM, RepeatVector, TimeDistributed, Dense
+from tensorflow.keras.callbacks import EarlyStopping
+
+from google.colab import drive
+drive.mount('/content/drive')
+# Convert 'Date' column to datetime objects
+df['Date'] = pd.to_datetime(df['Date'])
+
+# Sort data by Date (important for time series)
+df = df.sort_values(by='Date').reset_index(drop=True)
+
+# Check for missing values
+print('Missing values before preprocessing:')
+print(df.isnull().sum())
+
+# For simplicity, we'll focus on 'AQI Value' for the autoencoder
+# If there were missing values, common strategies include interpolation or removal.
+# For now, let's assume 'AQI Value' is clean or will be handled by scaling.
+
+# Select the feature for the autoencoder
+data = df[['AQI Value']]
+
+# Scale the data to a range between 0 and 1
+scaler = MinMaxScaler()
+data_scaled = scaler.fit_transform(data)
+
+print('\nData after scaling (first 5 rows):')
+print(data_scaled[:5])
+def create_sequences(data, timesteps):
+    X = []
+    for i in range(len(data) - timesteps):
+        X.append(data[i:(i + timesteps), 0])
+    return np.array(X)
+
+# Define the number of timesteps (lookback period)
+timesteps = 30  # This can be tuned
+
+# Create sequences for the scaled AQI data
+X = create_sequences(data_scaled, timesteps)
+
+# Reshape data for LSTM input: (samples, timesteps, features)
+# Since we have only one feature ('AQI Value'), the last dimension is 1.
+X = X.reshape(X.shape[0], X.shape[1], 1)
+
+print(f"Shape of input sequences: {X.shape}")
+print("First sequence example:")
+print(X[0])
+
+# Define the Autoencoder model
+def create_lstm_autoencoder(timesteps, n_features, latent_dim=16):
+    # Encoder
+    inputs = Input(shape=(timesteps, n_features))
+    encoder = LSTM(latent_dim, activation='relu', return_sequences=False)(inputs)
+
+    # Decoder
+    decoder = RepeatVector(timesteps)(encoder)
+    decoder = LSTM(latent_dim, activation='relu', return_sequences=True)(decoder)
+    output = TimeDistributed(Dense(n_features))(decoder)
+
+    model = Model(inputs=inputs, outputs=output)
+    return model
+
+# Get the number of features (should be 1 for 'AQI Value')
+n_features = X.shape[2]
+
+# Create the model
+model = create_lstm_autoencoder(timesteps, n_features)
+
+# Compile the model
+model.compile(optimizer='adam', loss='mae')
+
+# Print model summary
+print(model.summary())
+
+
+
+# Split data into training and validation sets
+X_train, X_val = train_test_split(X, test_size=0.2, random_state=42)
+
+print(f"Shape of training sequences: {X_train.shape}")
+print(f"Shape of validation sequences: {X_val.shape}")
+
+# Define EarlyStopping callback
+early_stopping = EarlyStopping(
+    monitor='val_loss',
+    patience=5,
+    mode='min',
+    restore_best_weights=True
+)
+
+# Train the model
+history = model.fit(
+    X_train, X_train, # Autoencoder trains to reconstruct its input
+    epochs=50, # You might increase this for better performance
+    batch_size=32,
+    validation_data=(X_val, X_val),
+    callbacks=[early_stopping],
+    verbose=1
+)
+
+# Plot training history (loss over epochs)
+plt.figure(figsize=(10, 6))
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Training Loss')
+plt.ylabel('Loss (MAE)')
+plt.xlabel('Epoch')
+plt.legend()
+plt.show()# Reconstruct the input sequences
+X_reconstructed = model.predict(X)
+
+# Calculate reconstruction error for each sequence
+# We'll use Mean Absolute Error (MAE) as our error metric
+reconstruction_errors = np.mean(np.abs(X - X_reconstructed), axis=(1, 2))
+
+print(f"Shape of reconstructed sequences: {X_reconstructed.shape}")
+print(f"Shape of reconstruction errors: {reconstruction_errors.shape}")
+print("First 5 reconstruction errors:")
+print(reconstruction_errors[:5])
+# Function to plot original and reconstructed sequences
+def plot_reconstruction(original, reconstructed, index, title='Original vs. Reconstructed Sequence'):
+    plt.figure(figsize=(12, 6))
+    plt.plot(original[index, :, 0], label='Original AQI')
+    plt.plot(reconstructed[index, :, 0], label='Reconstructed AQI')
+    plt.title(title)
+    plt.xlabel('Time Step')
+    plt.ylabel('Scaled AQI Value')
+    plt.legend()
+    plt.show()
+
+# Plot a few random sequences to visualize reconstruction
+num_plots = 5
+random_indices = np.random.choice(len(X), num_plots, replace=False)
+
+for i, idx in enumerate(random_indices):
+    plot_reconstruction(X, X_reconstructed, idx, title=f'Sample {i+1}: Original vs. Reconstructed Sequence (Error: {reconstruction_errors[idx]:.4f})')
+
+# Plot the distribution of reconstruction errors
+plt.figure(figsize=(12, 6))
+sns.histplot(reconstruction_errors, bins=50, kde=True)
+plt.title('Distribution of Reconstruction Errors (MAE)')
+plt.xlabel('Reconstruction Error (MAE)')
+plt.ylabel('Frequency')
+
+# Define a threshold for anomaly detection
+# A common approach is to use a percentile or mean + std deviation
+threshold = np.mean(reconstruction_errors) + 2 * np.std(reconstruction_errors) # Example: mean + 2 standard deviations
+# Alternatively, you can use a percentile:
+# threshold = np.percentile(reconstruction_errors, 95) # e.g., 95th percentile
+
+plt.axvline(threshold, color='r', linestyle='--', label=f'Anomaly Threshold: {threshold:.4f}')
+plt.legend()
+plt.show()
+
+print(f"Anomaly Threshold: {threshold:.4f}")
+
+# Identify anomalies
+anomalies = reconstruction_errors > threshold
+print(f"Number of anomalies detected: {np.sum(anomalies)}")
+# To align anomalies with original data, we need to consider the `timesteps` offset.
+# The reconstruction_errors array has a length of len(data) - timesteps.
+# So, the anomalies correspond to the data points starting from index `timesteps`.
+
+# Create an array to store anomaly flags for the original `data` length
+anomaly_flags = np.zeros(len(data))
+
+# Assign anomaly flags where anomalies were detected in the sequences
+anomaly_flags[timesteps:] = anomalies
+
+# Add reconstruction errors and anomaly flags to the original DataFrame for better visualization
+# Note: errors are for sequences, so aligning them with the exact point might require careful indexing.
+# For simplicity, we'll associate the error of a sequence with its last point.
+
+df_results = df.copy()
+df_results['reconstruction_error'] = np.nan # Initialize with NaN
+df_results['is_anomaly'] = False # Initialize with False
+
+# Fill in the reconstruction errors and anomaly flags
+# The (i + timesteps - 1) index corresponds to the last point of the i-th sequence.
+# This aligns the error of a sequence with the end of that sequence in the original time series.
+for i in range(len(reconstruction_errors)):
+    df_results.loc[timesteps + i, 'reconstruction_error'] = reconstruction_errors[i]
+    df_results.loc[timesteps + i, 'is_anomaly'] = anomalies[i]
+
+# Visualize the original AQI time series with anomalies highlighted
+plt.figure(figsize=(20, 8))
+plt.plot(df_results['Date'], df_results['AQI Value'], label='Original AQI Value', color='blue', alpha=0.7)
+
+# Highlight anomalies
+anomalous_points = df_results[df_results['is_anomaly'] == True]
+plt.scatter(anomalous_points['Date'], anomalous_points['AQI Value'], color='red', label='Anomaly', s=50, zorder=5)
+
+plt.title('AQI Time Series with Detected Anomalies')
+plt.xlabel('Date')
+plt.ylabel('AQI Value')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+print("Anomaly detection process complete. Anomalies highlighted in the plot above.")
